@@ -12,14 +12,10 @@ import tempfile
 import boto3
 import sagemaker
 from sagemaker.predictor import Predictor
-from sagemaker.serializers import CSVSerializer
-from sagemaker.deserializers import JSONDeserializer
 from sagemaker.serializers import NumpySerializer
 from sagemaker.deserializers import NumpyDeserializer
 
-from sklearn.pipeline import Pipeline
 import shap
-
 
 # Setup & Path Configuration
 warnings.simplefilter("ignore")
@@ -40,7 +36,7 @@ aws_bucket = st.secrets["aws_credentials"]["AWS_BUCKET"]
 aws_endpoint = st.secrets["aws_credentials"]["AWS_ENDPOINT"]
 
 # AWS Session Management
-@st.cache_resource # Use this to avoid downloading the file every time the page refreshes
+@st.cache_resource
 def get_session(aws_id, aws_secret, aws_token):
     return boto3.Session(
         aws_access_key_id=aws_id,
@@ -60,7 +56,7 @@ MODEL_INFO = {
     "explainer": "explainer.shap",
     "pipeline": "finalized_model.tar.gz",
 
-    # 15 features your SageMaker pipeline expects (this fixes the 11 vs 15 error)
+    # EXACT 15 features expected by SageMaker model (order matters!)
     "keys": [
         "JPM","MS","C","WFC","BAC","COF",
         "DEXJPUS","DEXUSUK","SP500","DJIA","VIXCLS",
@@ -75,60 +71,89 @@ MODEL_INFO = {
         for k in ["JPM","MS","C","WFC","BAC","COF","DEXJPUS","DEXUSUK","SP500","DJIA","VIXCLS"]
     ]
 }
-def load_pipeline(_session, bucket, key):
-    s3_client = _session.client('s3')
-    filename=MODEL_INFO["pipeline"]
-
-    s3_client.download_file(
-        Filename=filename, 
-        Bucket=bucket, 
-        Key= f"{key}/{os.path.basename(filename)}")
-        # Extract the .joblib file from the .tar.gz
-    with tarfile.open(filename, "r:gz") as tar:
-        tar.extractall(path=".")
-        joblib_file = [f for f in tar.getnames() if f.endswith('.joblib')][0]
-
-    # Load the full pipeline
-    return joblib.load(f"{joblib_file}")
 
 def load_shap_explainer(_session, bucket, key, local_path):
     s3_client = _session.client('s3')
-    local_path = local_path
 
-    # Only download if it doesn't exist locally to save time
     if not os.path.exists(local_path):
         s3_client.download_file(Filename=local_path, Bucket=bucket, Key=key)
-        
+
     with open(local_path, "rb") as f:
         return shap.Explainer.load(f)
 
-# Prediction Logic
-def call_model_api(input_df):
+# ---------- CORE FIX: Build a 1x15 payload in the right order ----------
+def build_payload_row(df_features: pd.DataFrame, user_inputs: dict) -> pd.DataFrame:
+    """
+    Returns a single-row DataFrame with exactly the 15 model features in MODEL_INFO['keys'] order.
 
+    Strategy:
+    - Start with 0.0 defaults for all 15 expected features
+    - If df_features contains any of those feature columns, use the LAST row values as baseline
+      (this preserves engineered features like GS_mom5, etc.)
+    - Overwrite the 11 UI features with the user-provided values
+    """
+    feature_cols = MODEL_INFO["keys"]
+
+    # start with zeros
+    row = {c: 0.0 for c in feature_cols}
+
+    # if df_features has matching columns, seed from its last row
+    if isinstance(df_features, pd.DataFrame) and len(df_features) > 0:
+        last = df_features.iloc[-1]
+        for c in feature_cols:
+            if c in df_features.columns:
+                val = last[c]
+                row[c] = 0.0 if pd.isna(val) or np.isinf(val) else float(val)
+
+    # overwrite base inputs from UI
+    for k, v in user_inputs.items():
+        if k in row:
+            row[k] = float(v)
+
+    payload_df = pd.DataFrame([row], columns=feature_cols)
+
+    # sanitize
+    payload_df = payload_df.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    return payload_df
+
+# Prediction Logic (send ONLY 1x15)
+def call_model_api(payload_df: pd.DataFrame):
     predictor = Predictor(
         endpoint_name=MODEL_INFO["endpoint"],
         sagemaker_session=sm_session,
         serializer=NumpySerializer(),
-        deserializer=NumpyDeserializer() 
+        deserializer=NumpyDeserializer()
     )
 
     try:
-        raw_pred = predictor.predict(input_df)
-        pred_val = pd.DataFrame(raw_pred).values[-1][0]
-        return round(float(pred_val), 4), 200
+        # IMPORTANT: send numpy array of shape (1, 15) in correct order
+        X = payload_df.to_numpy(dtype=np.float32)
+
+        raw_pred = predictor.predict(X)  # raw_pred could be np array
+        pred_val = float(np.array(raw_pred).reshape(-1)[0])
+
+        return round(pred_val, 4), 200
     except Exception as e:
         return f"Error: {str(e)}", 500
 
-# Local Explainability
-def display_explanation(input_df, session, aws_bucket):
+# Local Explainability (use the same 1-row payload)
+def display_explanation(payload_df, session, aws_bucket):
     explainer_name = MODEL_INFO["explainer"]
-    explainer = load_shap_explainer(session, aws_bucket, posixpath.join('explainer', explainer_name),os.path.join(tempfile.gettempdir(), explainer_name))
-    shap_values = explainer(input_df)
+    explainer = load_shap_explainer(
+        session,
+        aws_bucket,
+        posixpath.join('explainer', explainer_name),
+        os.path.join(tempfile.gettempdir(), explainer_name)
+    )
+
+    shap_values = explainer(payload_df)
+
     st.subheader("🔍 Decision Transparency (SHAP)")
     fig, ax = plt.subplots(figsize=(10, 4))
-    shap.plots.waterfall(shap_values[0], max_display=10)
+    shap.plots.waterfall(shap_values[0], max_display=10, show=False)
     st.pyplot(fig)
-    # top feature   
+
     top_feature = shap_values[0].feature_names[0]
     st.info(f"**Business Insight:** The most influential factor in this decision was **{top_feature}**.")
 
@@ -137,46 +162,33 @@ st.set_page_config(page_title="ML Deployment", layout="wide")
 st.title("👨‍💻 ML Deployment")
 
 with st.form("pred_form"):
-    st.subheader(f"Inputs")
+    st.subheader("Inputs")
     cols = st.columns(2)
     user_inputs = {}
-    
+
     for i, inp in enumerate(MODEL_INFO["inputs"]):
         with cols[i % 2]:
             user_inputs[inp['name']] = st.number_input(
                 inp['name'].replace('_', ' ').upper(),
-                min_value=inp['min'], max_value=inp['max'], value=inp['default'], step=inp['step']
+                min_value=inp['min'],
+                max_value=inp['max'],
+                value=inp['default'],
+                step=inp['step']
             )
-    
+
     submitted = st.form_submit_button("Run Prediction")
 
 if submitted:
+    # Build correct 1x15 payload
+    payload_df = build_payload_row(df_features, user_inputs)
 
-    # Prepare data
-    base_df = df_features
+    # Debug line (keep until it works once)
+    st.write("Payload shape (must be 1 x 15):", payload_df.shape)
 
-    # Build row aligned to model feature columns
-    data_dict = {col: user_inputs.get(col, 0.0) for col in base_df.columns}
-
-    new_row_df = pd.DataFrame([data_dict], columns=base_df.columns)
-
-    # Append to base dataframe
-    input_df = pd.concat([base_df, new_row_df], ignore_index=True)
-
-    res, status = call_model_api(input_df)
+    res, status = call_model_api(payload_df)
 
     if status == 200:
         st.metric("Prediction Result", res)
-        display_explanation(input_df, session, aws_bucket)
+        display_explanation(payload_df, session, aws_bucket)
     else:
         st.error(res)
-
-
-
-
-
-
-
-
-
-
