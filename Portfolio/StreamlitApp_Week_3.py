@@ -56,19 +56,19 @@ sm_session = sagemaker.Session(boto_session=session)
 MODEL_INFO = {
     "endpoint": aws_endpoint,
 
-    # MUST match your upload location exactly (case-sensitive)
-    # From your notebook: s3://sagemaker-us-east-1-684398918081/sklearn-pipeline-deployment/explainer.shap
+    # MUST match your upload exactly:
+    # s3://<AWS_BUCKET>/sklearn-pipeline-deployment/explainer.shap
     "explainer_s3_key": "sklearn-pipeline-deployment/explainer.shap",
     "explainer_local_name": "explainer.shap",
 
-    # 15 expected model features (order matters)
+    # 15 model features (order matters!)
     "keys": [
         "JPM","MS","C","WFC","BAC","COF",
         "DEXJPUS","DEXUSUK","SP500","DJIA","VIXCLS",
         "GS_mom5","GS_vol20","GS_hl_range","GS_ma10_50_gap"
     ],
 
-    # UI inputs (11)
+    # 11 UI features
     "ui_keys": [
         "JPM","MS","C","WFC","BAC","COF",
         "DEXJPUS","DEXUSUK","SP500","DJIA","VIXCLS"
@@ -105,7 +105,8 @@ def s3_list(bucket: str, prefix: str, max_keys: int = 50):
     return [o["Key"] for o in resp.get("Contents", [])]
 
 # =========================
-# SHAP loader (correct)
+# ✅ SHAP loader (UPDATED FIX)
+# In your Streamlit env, shap.Explainer.load expects a file-like object.
 # =========================
 def load_shap_explainer(_session, bucket: str, key: str, local_path: str):
     s3 = _session.client("s3")
@@ -114,8 +115,9 @@ def load_shap_explainer(_session, bucket: str, key: str, local_path: str):
     if not os.path.exists(local_path):
         s3.download_file(Bucket=bucket, Key=key, Filename=local_path)
 
-    # ✅ Correct: load from PATH
-    return shap.Explainer.load(local_path)
+    # ✅ FIX: pass file handle (rb), not a path string
+    with open(local_path, "rb") as f:
+        return shap.Explainer.load(f)
 
 # =========================
 # SageMaker Prediction
@@ -128,7 +130,7 @@ def call_model_api(input_df: pd.DataFrame):
         deserializer=NumpyDeserializer(),
     )
 
-    X = input_df.to_numpy(dtype=np.float32)  # (1,15)
+    X = input_df.to_numpy(dtype=np.float32)  # (1, 15)
     raw_pred = predictor.predict(X)
     pred_val = float(np.array(raw_pred).reshape(-1)[0])
     return round(pred_val, 4), 200
@@ -188,16 +190,16 @@ with st.form("pred_form"):
 if submitted:
     row = df_features.iloc[-1].copy()
 
-    # overwrite 11 user inputs
+    # overwrite 11 UI inputs
     for k in MODEL_INFO["ui_keys"]:
         row[k] = user_inputs[k]
 
-    # warn about missing engineered features
+    # warn on missing engineered features
     missing = [k for k in MODEL_INFO["keys"] if k not in row.index]
     if missing:
         st.warning(f"Missing engineered features in df_features (filled with 0.0): {missing}")
 
-    # align to 15 in correct order
+    # align to 15 features in correct order
     row_aligned = row.reindex(MODEL_INFO["keys"], fill_value=0.0)
     input_df = pd.DataFrame([row_aligned], columns=MODEL_INFO["keys"])
 
@@ -213,6 +215,5 @@ if submitted:
         except Exception as e:
             st.error("Prediction succeeded, but SHAP failed with this exact error:")
             st.exception(e)
-
     else:
         st.error(res)
