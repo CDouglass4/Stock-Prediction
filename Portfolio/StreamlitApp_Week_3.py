@@ -143,17 +143,25 @@ with st.form("pred_form"):
 
 if submitted:
 
-    data_row = [user_inputs[k] for k in MODEL_INFO["keys"]]
     # Prepare data
-    base_df = df_features
-    input_df = pd.concat([base_df, pd.DataFrame([data_row], columns=base_df.columns)])
-    
-    res, status = call_model_api(input_df)
-    if status == 200:
-        st.metric("Prediction Result", res)
-        display_explanation(input_df,session, aws_bucket)
-    else:
-        st.error(res)
+base_df = df_features
+
+# Build row aligned to model feature columns
+data_dict = {col: user_inputs.get(col, 0.0) for col in base_df.columns}
+
+new_row_df = pd.DataFrame([data_dict], columns=base_df.columns)
+
+# Append to base dataframe
+input_df = pd.concat([base_df, new_row_df], ignore_index=True)
+
+res, status = call_model_api(input_df)
+
+if status == 200:
+    st.metric("Prediction Result", res)
+    display_explanation(input_df, session, aws_bucket)
+else:
+    st.error(res)
+
 
 
 
