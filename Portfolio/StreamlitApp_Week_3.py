@@ -181,22 +181,27 @@ with st.form("pred_form"):
     submitted = st.form_submit_button("Run Prediction")
 
 if submitted:
-    # Build correct 1x15 payload
-    payload_df = build_payload_row(df_features, user_inputs)
 
-    # Debug line (keep until it works once)
-    st.write("Payload shape (must be 1 x 15):", payload_df.shape)
+    # Prepare data
+    base_df = df_features
+
+    # Build full 15-feature row
+    full_feature_row = {k: user_inputs.get(k, 0.0) for k in MODEL_INFO["keys"]}
+
+    payload_df = pd.DataFrame([full_feature_row], columns=MODEL_INFO["keys"])
 
     res, status = call_model_api(payload_df)
 
     if status == 200:
-    st.metric("Prediction Result", res)
+        st.metric("Prediction Result", res)
 
-    try:
-        display_explanation(payload_df, session, aws_bucket)
-    except Exception as e:
-        st.warning("Prediction worked, but SHAP explanation could not be loaded from S3.")
-        st.write(str(e))
-else:
-    st.error(res)
+        try:
+            display_explanation(payload_df, session, aws_bucket)
+        except Exception as e:
+            st.warning("Prediction worked, but SHAP explanation could not be loaded from S3.")
+            st.write(str(e))
+
+    else:
+        st.error(res)
+
 
