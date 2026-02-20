@@ -139,26 +139,27 @@ def call_model_api(payload_df: pd.DataFrame):
 
 # Local Explainability (use the same 1-row payload)
 def display_explanation(payload_df, session, aws_bucket):
-    # S3 key for the SHAP explainer file (set this in Streamlit secrets)
-    explainer_key = st.secrets["aws_credentials"]["AWS_EXPLAINER_KEY"]
+    # Load SHAP explainer locally from the same folder as this file
+    explainer_path = os.path.join(current_dir, "explainer.shap")
 
-    explainer = load_shap_explainer(
-        session,
-        aws_bucket,
-        explainer_key,
-        os.path.join(tempfile.gettempdir(), os.path.basename(explainer_key))
-    )
+    if not os.path.exists(explainer_path):
+        st.warning("SHAP explainer file not found in Portfolio folder.")
+        return
+
+    explainer = shap.Explainer.load(explainer_path)
 
     shap_values = explainer(payload_df)
 
     st.subheader("🔍 Decision Transparency (SHAP)")
+
     fig, ax = plt.subplots(figsize=(10, 4))
     shap.plots.waterfall(shap_values[0], max_display=10, show=False)
     st.pyplot(fig)
 
-    top_feature = shap_values[0].feature_names[0]
-    st.info(f"**Business Insight:** The most influential factor in this decision was **{top_feature}**.")
-
+    # Safely extract top feature
+    if hasattr(shap_values[0], "feature_names") and shap_values[0].feature_names:
+        top_feature = shap_values[0].feature_names[0]
+        st.info(f"**Business Insight:** The most influential factor was **{top_feature}**.")
 # Streamlit UI
 st.set_page_config(page_title="ML Deployment", layout="wide")
 st.title("👨‍💻 ML Deployment")
@@ -203,5 +204,6 @@ if submitted:
 
     else:
         st.error(res)
+
 
 
