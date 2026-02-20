@@ -139,11 +139,11 @@ def call_model_api(payload_df: pd.DataFrame):
 
 # Local Explainability (use the same 1-row payload)
 def display_explanation(payload_df, session, aws_bucket):
-    # Load SHAP explainer locally from the same folder as this file
+    # Load SHAP explainer locally from Portfolio folder
     explainer_path = os.path.join(current_dir, "explainer.shap")
 
     if not os.path.exists(explainer_path):
-        st.warning("SHAP explainer file not found in Portfolio folder.")
+        st.error("explainer.shap not found in Portfolio folder.")
         return
 
     explainer = shap.Explainer.load(explainer_path)
@@ -152,7 +152,7 @@ def display_explanation(payload_df, session, aws_bucket):
 
     st.subheader("🔍 Decision Transparency (SHAP)")
 
-    fig, ax = plt.subplots(figsize=(10, 4))
+    fig = plt.figure(figsize=(10, 4))
     shap.plots.waterfall(shap_values[0], max_display=10, show=False)
     st.pyplot(fig)
 
@@ -204,6 +204,7 @@ if submitted:
 
     else:
         st.error(res)
+
 
 
 
