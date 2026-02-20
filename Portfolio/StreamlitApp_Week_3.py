@@ -139,12 +139,14 @@ def call_model_api(payload_df: pd.DataFrame):
 
 # Local Explainability (use the same 1-row payload)
 def display_explanation(payload_df, session, aws_bucket):
-    explainer_name = MODEL_INFO["explainer"]
+    # S3 key for the SHAP explainer file (set this in Streamlit secrets)
+    explainer_key = st.secrets["aws_credentials"]["AWS_EXPLAINER_KEY"]
+
     explainer = load_shap_explainer(
         session,
         aws_bucket,
-        posixpath.join('explainer', explainer_name),
-        os.path.join(tempfile.gettempdir(), explainer_name)
+        explainer_key,
+        os.path.join(tempfile.gettempdir(), os.path.basename(explainer_key))
     )
 
     shap_values = explainer(payload_df)
@@ -188,7 +190,13 @@ if submitted:
     res, status = call_model_api(payload_df)
 
     if status == 200:
-        st.metric("Prediction Result", res)
+    st.metric("Prediction Result", res)
+
+    try:
         display_explanation(payload_df, session, aws_bucket)
-    else:
-        st.error(res)
+    except Exception as e:
+        st.warning("Prediction worked, but SHAP explanation could not be loaded from S3.")
+        st.write(str(e))
+else:
+    st.error(res)
+
