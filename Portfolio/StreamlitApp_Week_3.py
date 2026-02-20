@@ -59,8 +59,8 @@ MODEL_INFO = {
         "endpoint": aws_endpoint,
         "explainer": 'explainer.shap',
         "pipeline": 'finalized_model.tar.gz',
-        "keys": ['NVDA', 'MSFT', 'RACE','META','TSM'],
-        "inputs": [{"name": k, "type": "number", "min": -1.0, "max": 1.0, "default": 0.0, "step": 0.01} for k in ['NVDA', 'MSFT', 'RACE','META','TSM']]
+        "keys": ['JPM', 'MS', 'C','WFC','BAC','COF','DEXJPUS','DEXUSUK','SP500','DJIA','VIXCLS']
+        "inputs": [{"name": k, "type": "number", "min": -1.0, "max": 1.0, "default": 0.0, "step": 0.01} for k in ['JPM', 'MS', 'C','WFC','BAC','COF','DEXJPUS','DEXUSUK','SP500','DJIA','VIXCLS']]
 }
 
 def load_pipeline(_session, bucket, key):
@@ -151,6 +151,7 @@ if submitted:
         display_explanation(input_df,session, aws_bucket)
     else:
         st.error(res)
+
 
 
 
