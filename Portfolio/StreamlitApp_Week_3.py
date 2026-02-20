@@ -12,6 +12,7 @@ from sagemaker.serializers import NumpySerializer
 from sagemaker.deserializers import NumpyDeserializer
 
 import shap
+from botocore.exceptions import ClientError
 
 # =========================
 # Setup
@@ -50,27 +51,24 @@ session = get_session(aws_id, aws_secret, aws_token)
 sm_session = sagemaker.Session(boto_session=session)
 
 # =========================
-# Data
-# =========================
-df_features = extract_features()
-
-# =========================
 # Model Config
 # =========================
 MODEL_INFO = {
     "endpoint": aws_endpoint,
 
-    # Must match your upload:
-    # s3://sagemaker-us-east-1-684398918081/sklearn-pipeline-deployment/explainer.shap
+    # MUST match your upload location exactly (case-sensitive)
+    # From your notebook: s3://sagemaker-us-east-1-684398918081/sklearn-pipeline-deployment/explainer.shap
     "explainer_s3_key": "sklearn-pipeline-deployment/explainer.shap",
     "explainer_local_name": "explainer.shap",
 
+    # 15 expected model features (order matters)
     "keys": [
         "JPM","MS","C","WFC","BAC","COF",
         "DEXJPUS","DEXUSUK","SP500","DJIA","VIXCLS",
         "GS_mom5","GS_vol20","GS_hl_range","GS_ma10_50_gap"
     ],
 
+    # UI inputs (11)
     "ui_keys": [
         "JPM","MS","C","WFC","BAC","COF",
         "DEXJPUS","DEXUSUK","SP500","DJIA","VIXCLS"
@@ -82,33 +80,41 @@ MODEL_INFO = {
             "JPM","MS","C","WFC","BAC","COF",
             "DEXJPUS","DEXUSUK","SP500","DJIA","VIXCLS"
         ]
-    ]
+    ],
 }
 
 # =========================
-# S3 Utility
+# Data
 # =========================
-def load_shap_explainer(_session, bucket, key, local_path):
-    s3 = _session.client("s3")
+df_features = extract_features()
 
+# =========================
+# S3 Debug helpers
+# =========================
+def s3_exists(bucket: str, key: str) -> bool:
+    s3 = session.client("s3")
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError:
+        return False
+
+def s3_list(bucket: str, prefix: str, max_keys: int = 50):
+    s3 = session.client("s3")
+    resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=max_keys)
+    return [o["Key"] for o in resp.get("Contents", [])]
+
+# =========================
+# SHAP loader (correct)
+# =========================
+def load_shap_explainer(_session, bucket: str, key: str, local_path: str):
+    s3 = _session.client("s3")
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
     if not os.path.exists(local_path):
-        try:
-            s3.download_file(Bucket=bucket, Key=key, Filename=local_path)
-        except Exception as e:
-            if hasattr(e, "response"):
-                code = e.response.get("Error", {}).get("Code", "Unknown")
-                msg = e.response.get("Error", {}).get("Message", "No message")
-                st.error(f"S3 download failed: {code} — {msg}")
-            else:
-                st.error(f"S3 download failed: {repr(e)}")
+        s3.download_file(Bucket=bucket, Key=key, Filename=local_path)
 
-            st.error(f"Bucket: {bucket}")
-            st.error(f"Key attempted: {key}")
-            raise
-
-    # ✅ Correct way to load
+    # ✅ Correct: load from PATH
     return shap.Explainer.load(local_path)
 
 # =========================
@@ -122,40 +128,29 @@ def call_model_api(input_df: pd.DataFrame):
         deserializer=NumpyDeserializer(),
     )
 
-    try:
-        X = input_df.to_numpy(dtype=np.float32)
-        raw_pred = predictor.predict(X)
-        pred_val = np.array(raw_pred).reshape(-1)[0]
-        return round(float(pred_val), 4), 200
-    except Exception as e:
-        return f"Error: {str(e)}", 500
+    X = input_df.to_numpy(dtype=np.float32)  # (1,15)
+    raw_pred = predictor.predict(X)
+    pred_val = float(np.array(raw_pred).reshape(-1)[0])
+    return round(pred_val, 4), 200
 
 # =========================
-# SHAP Display
+# SHAP display
 # =========================
-def display_explanation(input_df, _session, _bucket):
+def display_explanation(input_df: pd.DataFrame):
     s3_key = MODEL_INFO["explainer_s3_key"]
-    local_path = os.path.join(
-        tempfile.gettempdir(),
-        MODEL_INFO["explainer_local_name"]
-    )
+    local_path = os.path.join(tempfile.gettempdir(), MODEL_INFO["explainer_local_name"])
 
-    explainer = load_shap_explainer(_session, _bucket, s3_key, local_path)
+    explainer = load_shap_explainer(session, aws_bucket, s3_key, local_path)
     shap_values = explainer(input_df)
 
     st.subheader("🔍 Decision Transparency (SHAP)")
-
     shap.plots.waterfall(shap_values[0], max_display=10, show=False)
     st.pyplot(plt.gcf(), clear_figure=True)
 
     vals = shap_values[0].values
     names = shap_values[0].feature_names
     top_idx = int(np.argmax(np.abs(vals)))
-
-    st.info(
-        f"**Business Insight:** "
-        f"The most influential factor was **{names[top_idx]}**."
-    )
+    st.info(f"**Business Insight:** The most influential factor was **{names[top_idx]}**.")
 
 # =========================
 # Streamlit UI
@@ -163,9 +158,15 @@ def display_explanation(input_df, _session, _bucket):
 st.set_page_config(page_title="ML Deployment", layout="wide")
 st.title("👨‍💻 ML Deployment")
 
+with st.expander("🔧 Debug SHAP in S3 (open if SHAP fails)", expanded=False):
+    st.write("AWS_BUCKET secret:", aws_bucket)
+    st.write("Explainer key:", MODEL_INFO["explainer_s3_key"])
+    st.write("Explainer exists?:", s3_exists(aws_bucket, MODEL_INFO["explainer_s3_key"]))
+    st.write("Keys under sklearn-pipeline-deployment/:")
+    st.write(s3_list(aws_bucket, "sklearn-pipeline-deployment/"))
+
 with st.form("pred_form"):
     st.subheader("Inputs")
-
     cols = st.columns(2)
     user_inputs = {}
 
@@ -176,7 +177,7 @@ with st.form("pred_form"):
                 min_value=inp["min"],
                 max_value=inp["max"],
                 value=inp["default"],
-                step=inp["step"]
+                step=inp["step"],
             )
 
     submitted = st.form_submit_button("Run Prediction")
@@ -187,31 +188,31 @@ with st.form("pred_form"):
 if submitted:
     row = df_features.iloc[-1].copy()
 
-    # overwrite 11 UI features
+    # overwrite 11 user inputs
     for k in MODEL_INFO["ui_keys"]:
         row[k] = user_inputs[k]
 
+    # warn about missing engineered features
     missing = [k for k in MODEL_INFO["keys"] if k not in row.index]
     if missing:
-        st.warning(
-            f"Missing engineered features in df_features "
-            f"(filled with 0.0): {missing}"
-        )
+        st.warning(f"Missing engineered features in df_features (filled with 0.0): {missing}")
 
+    # align to 15 in correct order
     row_aligned = row.reindex(MODEL_INFO["keys"], fill_value=0.0)
     input_df = pd.DataFrame([row_aligned], columns=MODEL_INFO["keys"])
 
-    result, status = call_model_api(input_df)
+    # call endpoint
+    res, status = call_model_api(input_df)
 
     if status == 200:
-        st.metric("Prediction Result", result)
+        st.metric("Prediction Result", res)
 
+        # show SHAP or show exact error
         try:
-            display_explanation(input_df, session, aws_bucket)
-        except Exception:
-            st.warning(
-                "Prediction succeeded, but SHAP explainer "
-                "could not be loaded from S3."
-            )
+            display_explanation(input_df)
+        except Exception as e:
+            st.error("Prediction succeeded, but SHAP failed with this exact error:")
+            st.exception(e)
+
     else:
-        st.error(result)
+        st.error(res)
