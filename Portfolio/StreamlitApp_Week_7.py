@@ -60,7 +60,7 @@ MODEL_INFO = {
         "explainer": 'explainer.shap',
         "pipeline": 'finalized_model.tar.gz',
         "keys": ["AOS", "TXT"],
-        "inputs": [{"name": k, "type": "number", "min": 0.0, "default": 0.0, "step": 10.0} for k in ["AAPL","MPWR"]]
+        "inputs": [{"name": k, "type": "number", "min": 0.0, "default": 0.0, "step": 10.0} for k in ["AOS","TXT"]]
 }
 
 def load_pipeline(_session, bucket, key):
