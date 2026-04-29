@@ -1,121 +1,247 @@
-
-import numpy as np
 import pandas as pd
+import numpy as np
+import statsmodels.api as sm
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import PowerTransformer
+from scipy.stats import skew
+from gensim.models import Word2Vec
 
 
-class DataCleaner(BaseEstimator, TransformerMixin):
-    def __init__(self, freq_cols=None, drop_cols=None):
-        self.freq_cols   = freq_cols or ["card4","card6","ProductCD",
-                                          "P_emaildomain","R_emaildomain",
-                                          "DeviceType","DeviceInfo"]
-        self.drop_cols   = drop_cols or ["TransactionID"]
-        self.freq_maps_  = {}
-        self.label_maps_ = {}
-        self.median_vals_= {}
-        self.cat_cols_   = []
-        self.num_cols_   = []
 
-    @staticmethod
-    def _recode_tf(df):
-        for c in [col for col in df.columns if col.startswith("M")]:
-            df[c] = df[c].map({"T": 1, "F": 0})
-        return df
+class AutoPowerTransformer(BaseEstimator, TransformerMixin):
+    def __init__(self, threshold=0.75):
+        self.threshold = threshold
+        self.skewed_cols = []
+        self.pt = PowerTransformer(method='yeo-johnson')
 
     def fit(self, X, y=None):
-        X = X.copy()
-        X.drop(columns=[c for c in self.drop_cols if c in X.columns], inplace=True)
-        X = self._recode_tf(X)
-        for c in self.freq_cols:
-            if c in X.columns:
-                self.freq_maps_[c] = X[c].value_counts(normalize=True).to_dict()
-        for c, m in self.freq_maps_.items():
-            X[c] = X[c].map(m)
-        self.num_cols_ = X.select_dtypes(include="number").columns.tolist()
-        self.cat_cols_ = X.select_dtypes(exclude="number").columns.tolist()
-        for c in self.num_cols_:
-            self.median_vals_[c] = X[c].median()
-        for c in self.cat_cols_:
-            X[c] = X[c].fillna("missing")
-            le = LabelEncoder()
-            le.fit(X[c].astype(str))
-            self.label_maps_[c] = le
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        
+        # PROTECTION: Only look at columns that are actually numeric
+        # This prevents the step from ever seeing a categorical string
+        numeric_df = X.select_dtypes(include=[np.number])
+        
+        if numeric_df.empty:
+            return self
+
+        # Only calculate skewness for numeric columns
+        skewness = numeric_df.apply(lambda x: skew(x.dropna()))
+        self.skewed_cols = skewness[abs(skewness) > self.threshold].index.tolist()
+        
+        if self.skewed_cols:
+            self.pt.fit(X[self.skewed_cols])
         return self
 
     def transform(self, X):
-        X = X.copy()
-        X.drop(columns=[c for c in self.drop_cols if c in X.columns], inplace=True)
-        X = self._recode_tf(X)
-        for c, m in self.freq_maps_.items():
-            if c in X.columns:
-                X[c] = X[c].map(m).fillna(0.0)
-        for c in self.num_cols_:
-            if c in X.columns:
-                X[c] = X[c].fillna(self.median_vals_.get(c, 0))
-        for c in self.cat_cols_:
-            if c in X.columns:
-                X[c] = X[c].fillna("missing").astype(str)
-                le = self.label_maps_[c]
-                known = set(le.classes_)
-                X[c] = X[c].apply(lambda v: v if v in known else "missing")
-                X[c] = le.transform(X[c])
-        return X
+        X_copy = X.copy()
+        if not isinstance(X_copy, pd.DataFrame):
+            X_copy = pd.DataFrame(X_copy)
+            
+        if self.skewed_cols:
+            X_copy[self.skewed_cols] = self.pt.transform(X_copy[self.skewed_cols])
+        return X_copy
 
+
+
+class FeatureSelector(BaseEstimator, TransformerMixin):
+    def __init__(self, missing_threshold=0.3, corr_threshold=0.03, cardinality_threshold=0.9):
+        self.missing_threshold = missing_threshold
+        self.corr_threshold = corr_threshold
+        self.cardinality_threshold = cardinality_threshold # Ratio of unique values to total rows
+        self.features_to_keep = []
+
+    def fit(self, X, y=None):
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        
+        # 1. Missing Values Filter
+        null_ratios = X.isnull().mean()
+        cols_low_missing = null_ratios[null_ratios <= self.missing_threshold].index.tolist()
+        X_filtered = X[cols_low_missing]
+
+        # 2. High Cardinality Filter (Only for Categorical/Object columns)
+        cat_cols = X_filtered.select_dtypes(exclude='number').columns
+        cols_to_drop = []
+        
+        for col in cat_cols:
+            uniqueness_ratio = X_filtered[col].nunique() / len(X_filtered)
+            if uniqueness_ratio > self.cardinality_threshold:
+                cols_to_drop.append(col)
+        
+        # Keep categoricals that are NOT high cardinality
+        remaining_cats = [c for c in cat_cols if c not in cols_to_drop]
+
+        # 3. Correlation Filter (Only for Numeric columns)
+        numeric_X = X_filtered.select_dtypes(include='number')
+        if y is not None and not numeric_X.empty:
+            temp_df = numeric_X.copy()
+            temp_df['target'] = y
+            correlations = temp_df.corr()['target'].abs().drop('target')
+            numeric_to_keep = correlations[correlations >= self.corr_threshold].index.tolist()
+        else:
+            numeric_to_keep = numeric_X.columns.tolist()
+
+        self.features_to_keep = numeric_to_keep + remaining_cats
+        return self
+
+    def transform(self, X):
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        return X[self.features_to_keep]
 
 class FeatureEngineer(BaseEstimator, TransformerMixin):
-    def __init__(self, missing_thresh=0.50, const_thresh=0.95):
-        self.missing_thresh = missing_thresh
-        self.const_thresh   = const_thresh
-        self.drop_missing_  = []
-        self.drop_const_    = []
-        self.card1_freq_    = {}
+    
+    def __init__(self, windows=[5, 10, 20]):
+        """
+        Initialize with a list of windows. 
+        Example: FeatureEngineer(windows=[5, 14, 30])
+        """
+        self.windows = windows
 
     def fit(self, X, y=None):
-        X = pd.DataFrame(X).copy()
-        null_ratio = X.isnull().mean()
-        self.drop_missing_ = null_ratio[null_ratio > self.missing_thresh].index.tolist()
-        self.drop_const_ = []
-        for c in X.columns:
-            if c in self.drop_missing_:
-                continue
-            if X[c].value_counts(normalize=True, dropna=False).iloc[0] > self.const_thresh:
-                self.drop_const_.append(c)
-        if "card1" in X.columns:
-            self.card1_freq_ = X["card1"].value_counts(normalize=True).to_dict()
         return self
 
     def transform(self, X):
-        X = pd.DataFrame(X).copy()
-        drop = list(set(self.drop_missing_ + self.drop_const_))
-        X.drop(columns=[c for c in drop if c in X.columns], inplace=True)
-        if "TransactionAmt" in X.columns:
-            X["TransactionAmt_log"] = np.log1p(X["TransactionAmt"])
-        if "TransactionDT" in X.columns:
-            X["hour"]        = (X["TransactionDT"] // 3600) % 24
-            X["day_of_week"] = (X["TransactionDT"] // 86400) % 7
-        if "TransactionAmt" in X.columns and "card1" in X.columns:
-            X["amt_x_card1"] = X["TransactionAmt"] * X["card1"]
-        if "TransactionAmt" in X.columns and "C1" in X.columns:
-            X["amt_per_C1"] = X["TransactionAmt"] / (X["C1"] + 1e-6)
-        if "card1" in X.columns:
-            X["card1_freq_enc"] = X["card1"].map(self.card1_freq_).fillna(0)
-        return X
+        # Handle input types
+        if isinstance(X, np.ndarray):
+            X_df = pd.DataFrame(X)
+        else:
+            X_df = X.copy()
 
+        # Ensure we are working with a Series for rolling/diff operations
+        # squeeze() is used if X_df is a single-column DataFrame
+        data = X_df.squeeze()
+        X_out = pd.DataFrame(index=X_df.index)
+        
+        # Iterate through each window to create multi-scale features
+        for w in self.windows:
+            
+            # 1. Exponential Moving Average
+            X_out[f'EMA_{w}'] = data.ewm(span=w, min_periods=w).mean()
 
-class DropCollinear(BaseEstimator, TransformerMixin):
-    def __init__(self, threshold=0.95):
-        self.threshold  = threshold
-        self.drop_cols_ = []
+            # 2. Rate of Change
+            M = data.diff(w - 1)
+            N = data.shift(w - 1)
+            X_out[f'ROC_{w}'] = (M / N) * 100
+
+            # 3. Price Momentum
+            X_out[f'MOM_{w}'] = data.diff(w)
+
+            # 4. Relative Strength Index (RSI)
+            delta = data.diff()
+            u = pd.Series(np.where(delta > 0, delta, 0), index=delta.index)
+            d = pd.Series(np.where(delta < 0, -delta, 0), index=delta.index)
+            avg_gain = u.ewm(com=w - 1, adjust=False).mean()
+            avg_loss = d.ewm(com=w - 1, adjust=False).mean()
+            rs = avg_gain / avg_loss
+            X_out[f'RSI_{w}'] = 100 - (100 / (1 + rs))
+            
+            # 5. Simple Moving Average
+            X_out[f'MA_{w}'] = data.rolling(w, min_periods=w).mean()
+
+            # 6. Oscillators
+
+        return X_out
+
+class PairFeatureEngineer(BaseEstimator, TransformerMixin):
+    def __init__(self, window=60):
+        self.window = window
+        # Internal state
+        self.last_beta_ = None
+        self.last_alpha_ = None
+        self.is_fitted_ = False
 
     def fit(self, X, y=None):
-        X_df  = pd.DataFrame(X)
-        num   = X_df.select_dtypes(include="number")
-        corr  = num.corr().abs()
-        upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
-        self.drop_cols_ = [c for c in upper.columns if any(upper[c] > self.threshold)]
+        """
+        Validates that the input data is sufficient for the window size.
+        In scikit-learn, fit must always return self.
+        """
+        if len(X) < self.window:
+            raise ValueError(f"Data length {len(X)} is less than window size {self.window}")
+        
+        self.is_fitted_ = True
         return self
 
     def transform(self, X):
-        X_df = pd.DataFrame(X)
-        return X_df.drop(columns=[c for c in self.drop_cols_ if c in X_df.columns])
+        """
+        X: Expected to be a DataFrame or Array with 2 columns: [Price_A, Price_B]
+        """
+        if not self.is_fitted_:
+            raise RuntimeError("Extractor must be fitted before calling transform.")
+
+        # Convert to DataFrame if input is a numpy array
+        if isinstance(X, np.ndarray):
+            df = pd.DataFrame(X, columns=['price_a', 'price_b'])
+        else:
+            df = X.copy()
+            df.columns = ['price_a', 'price_b']
+        
+        # 1. Compute Rolling Spread and Beta
+        df[['spread', 'beta']] = self._compute_rolling_regression(df)
+
+        # 2. Derive Statistics-based Features
+        df['z_score'] = self._calculate_z_score(df['spread'])
+        df['spread_std'] = df['spread'].rolling(self.window).std()
+        df['beta_stability'] = df['beta'].rolling(self.window).std()
+
+        
+        return df#.dropna()
+
+    def _compute_rolling_regression(self, df):
+        spreads = np.full(len(df), np.nan)
+        betas = np.full(len(df), np.nan)
+        
+        a_vals = df['price_a'].values
+        b_vals = df['price_b'].values
+
+        for i in range(self.window, len(df)):
+            y = a_vals[i-self.window:i]
+            x = b_vals[i-self.window:i]
+            x_with_const = sm.add_constant(x)
+            
+            model = sm.OLS(y, x_with_const).fit()
+            
+            alpha, beta = model.params[0], model.params[1]
+            betas[i] = beta
+            spreads[i] = a_vals[i] - (beta * b_vals[i] + alpha)
+            
+            # Update state for live prediction tracking
+            self.last_alpha_, self.last_beta_ = alpha, beta
+            
+        return pd.DataFrame({'spread': spreads, 'beta': betas}, index=df.index)
+
+    def _calculate_z_score(self, spread_series):
+        rolling_mean = spread_series.rolling(self.window).mean()
+        rolling_std = spread_series.rolling(self.window).std()
+        return (spread_series - rolling_mean) / rolling_std
+
+class Word2VecTransformer(BaseEstimator, TransformerMixin):
+    def __init__(self, vector_size=100, window=5, min_count=1):
+        self.vector_size = vector_size
+        self.window = window
+        self.min_count = min_count
+        self.model = None
+
+    def fit(self, X, y=None):
+        # create the word2vec model
+        sentences = [str(row[0]).split() for row in X]
+        self.model = Word2Vec(sentences, vector_size=self.vector_size, 
+                              window=self.window, min_count=self.min_count)
+        return self
+
+    def transform(self, X):
+        # Convert each headline into the average of its word vectors
+        def get_mean_vector(text):
+            words = str(text).split()
+            # Filter words that actually exist in the Word2Vec vocabulary
+            vectors = [self.model.wv[w] for w in words if w in self.model.wv]
+            if not vectors:
+                return np.zeros(self.vector_size)
+            return np.mean(vectors, axis=0)
+
+        return np.array([get_mean_vector(row[0]) for row in X])
+
+# --- Usage Example ---
+# extractor = PairFeatureExtractor(window=60)
+# features_df = extractor.transform(data['AAPL'], data['MSFT'])
